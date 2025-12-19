@@ -10,9 +10,12 @@ namespace WorkerUnTarService
     {
         public string ArchiveDirectory { get; set; }
         public string SourceFolder { get; set; }
+        public string ErrorFolder { get; set; }
         public uint ArchiveСlearedSeconds { get; set; }
         public bool ToArchivSourceFolder { get; set; }
         public bool OverwriteFiles { get; set; }
-  
+        public DateTime? StartTime { get; set; }
+        public int IntervalHours { get; set; } = 0;
+
     }
 }
