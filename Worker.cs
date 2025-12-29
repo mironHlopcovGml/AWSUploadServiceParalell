@@ -69,8 +69,8 @@ namespace AWSUploadService
             _toArchivSourceFolder = settings.ToArchivSourceFolder;
             _bucketName = aws.BucketName;
 
-            _startTime = settings.StartTime;
-            _intervalHours = settings.IntervalHours;
+            //_startTime = settings.StartTime;
+            //_intervalHours = settings.IntervalHours;
 
             ParseBucketName();
 

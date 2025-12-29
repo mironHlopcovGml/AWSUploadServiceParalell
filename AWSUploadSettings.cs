@@ -14,8 +14,8 @@ namespace WorkerUnTarService
         public uint ArchiveСlearedSeconds { get; set; }
         public bool ToArchivSourceFolder { get; set; }
         public bool OverwriteFiles { get; set; }
-        public DateTime? StartTime { get; set; }
-        public int IntervalHours { get; set; } = 0;
+        //public DateTime? StartTime { get; set; }
+        //public int IntervalHours { get; set; } = 0;
 
     }
 }
