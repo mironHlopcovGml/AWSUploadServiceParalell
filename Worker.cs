@@ -5,12 +5,12 @@ using Amazon.S3.Transfer;
 using Microsoft.Extensions.Options;
 using System;
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
+using System.Text;
 using System.Threading.Channels;
 using WorkerUnTarService;
-using WorkerUnTarService.Models;
+
 
 namespace AWSUploadService
 {
@@ -23,12 +23,10 @@ namespace AWSUploadService
         private readonly ILogger<Worker> _logger;
         private readonly IAmazonS3 _s3Client;
         private readonly TransferUtility _transferUtility;
-        private readonly string _processingMarker = ".processing";
-        private const long LargeFileThreshold = 2L * 1024 * 1024 * 1024;
-        private readonly ConcurrentDictionary<string, byte> _activeUploads = new ConcurrentDictionary<string, byte>();
+        private readonly ConcurrentDictionary<string, byte> _activeUploads = new();
 
-        private readonly string _targetBucketName;
-        private readonly string _targetBucketPrefix;
+        private  string _targetBucketName;
+        private  string _targetBucketPrefix;
 
         // Настройки
         private readonly string _sourceFolder;
@@ -37,61 +35,78 @@ namespace AWSUploadService
         private readonly uint _archiveClearedSeconds;
         private readonly bool _toArchivSourceFolder;
         private readonly string _bucketName;
+
         // Опции для расписания
-        private readonly DateTime? _startTime; // Время первого запуска
-        private readonly int _intervalHours;   // Периодичность в часах
+        private readonly DateTime? _startTime;
+        private readonly int _intervalHours;
 
         // Каналы данных
         private readonly Channel<FolderTask> _archivingChannel;
         private readonly Channel<UploadTask> _smallFilesChannel;
         private readonly Channel<UploadTask> _largeFilesChannel;
 
+        // Константы
+        private const string ProcessingMarker = ".processing";
+        private const long LargeFileThreshold = 2L * 1024 * 1024 * 1024; // 2 GB
+        private const int ChannelCapacity = 50;
+        private const int LargeChannelCapacity = 5;
+        private const int FileWriteDelaySeconds = 30;
+        private const int S3ConnectionRetries = 5;
+        private const int S3RetryDelayMs = 10000;
+        private const int DefaultScanDelayMs = 5000;
+        private const int S3PartSizeBytes = 200 * 1024 * 1024; // 200 MB
+
         public Worker(ILogger<Worker> logger, IOptions<AWSUploadSettings> options, IOptions<AWS> awsOptions)
         {
-            _logger = logger;
-            _sourceFolder = options.Value.SourceFolder;
-            _archiveDirectory = options.Value.ArchiveDirectory;
-            _errorDirectory = options.Value.ErrorFolder;
-            _archiveClearedSeconds = options.Value.ArchiveСlearedSeconds;
-            _toArchivSourceFolder = options.Value.ToArchivSourceFolder;
-            _bucketName = awsOptions.Value.BucketName;
-            // Чтение опций расписания
-            _startTime = options.Value.StartTime; 
-            _intervalHours = options.Value.IntervalHours; 
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            var settings = options.Value ?? throw new ArgumentNullException(nameof(options));
+            var aws = awsOptions.Value ?? throw new ArgumentNullException(nameof(awsOptions));
 
-            // ПАРСИНГ БАКЕТА В КОНСТРУКТОРЕ
+            _sourceFolder = settings.SourceFolder;
+            _archiveDirectory = settings.ArchiveDirectory;
+            _errorDirectory = settings.ErrorFolder;
+            _archiveClearedSeconds = settings.ArchiveСlearedSeconds;
+            _toArchivSourceFolder = settings.ToArchivSourceFolder;
+            _bucketName = aws.BucketName;
+
+            _startTime = settings.StartTime;
+            _intervalHours = settings.IntervalHours;
+
+            ParseBucketName();
+
+            var clientConfig = new AmazonS3Config
+            {
+                ServiceURL = aws.S3Endpoint,
+                AuthenticationRegion = aws.Region,
+                ForcePathStyle = true
+            };
+            _s3Client = new AmazonS3Client(aws.AccessKey, aws.SecretKey, clientConfig);
+            _transferUtility = new TransferUtility(_s3Client);
+
+            _archivingChannel = CreateBoundedChannel<FolderTask>(ChannelCapacity);
+            _smallFilesChannel = CreateBoundedChannel<UploadTask>(ChannelCapacity);
+            _largeFilesChannel = CreateBoundedChannel<UploadTask>(LargeChannelCapacity);
+        }
+
+        private void ParseBucketName()
+        {
             var slashIndex = _bucketName.IndexOf('/');
             if (slashIndex > 0)
             {
                 _targetBucketName = _bucketName.Substring(0, slashIndex);
-                var p = _bucketName.Substring(slashIndex + 1);
-                _targetBucketPrefix = !string.IsNullOrEmpty(p) && !p.EndsWith("/") ? p + "/" : p;
+                var prefix = _bucketName.Substring(slashIndex + 1);
+                _targetBucketPrefix = string.IsNullOrEmpty(prefix) || prefix.EndsWith("/") ? prefix : prefix + "/";
             }
             else
             {
                 _targetBucketName = _bucketName;
                 _targetBucketPrefix = string.Empty;
             }
+        }
 
-            var clientConfig = new AmazonS3Config
-            {
-                ServiceURL = awsOptions.Value.S3Endpoint,
-                AuthenticationRegion = awsOptions.Value.Region,
-                ForcePathStyle = true
-            };
-            _s3Client = new AmazonS3Client(awsOptions.Value.AccessKey, awsOptions.Value.SecretKey, clientConfig);
-            _transferUtility = new TransferUtility(_s3Client);
-
-            // Инициализация каналов
-            _archivingChannel = Channel.CreateBounded<FolderTask>(new BoundedChannelOptions(50)
-            {
-                FullMode = BoundedChannelFullMode.Wait
-            });
-            _smallFilesChannel = Channel.CreateBounded<UploadTask>(new BoundedChannelOptions(50)
-            {
-                FullMode = BoundedChannelFullMode.Wait
-            });
-            _largeFilesChannel = Channel.CreateBounded<UploadTask>(new BoundedChannelOptions(5)
+        private static Channel<T> CreateBoundedChannel<T>(int capacity)
+        {
+            return Channel.CreateBounded<T>(new BoundedChannelOptions(capacity)
             {
                 FullMode = BoundedChannelFullMode.Wait
             });
@@ -99,99 +114,47 @@ namespace AWSUploadService
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation($"** {typeof(Worker).Name} SERVICE STARTED (Pipeline Mode) **");
+            _logger.LogInformation($"** {nameof(Worker)} SERVICE STARTED (Pipeline Mode) **");
 
-            // --- ЭТАП 1: ВАЛИДАЦИЯ КОНФИГУРАЦИИ ---
+            #region Валидация и инициализация
             if (!ValidateConfiguration())
             {
                 _logger.LogCritical("Сервис остановлен из-за ошибок конфигурации.");
-                // В .NET BackgroundService выход из ExecuteAsync означает остановку сервиса
                 return;
             }
 
-            // --- ЭТАП 2: ПРОВЕРКА СВЯЗИ С S3 (Retry Policy) ---
-            // Делаем несколько попыток на случай, если сеть поднимается медленнее сервиса
-            bool s3Ready = false;
-            int retryCount = 0;
-            while (!stoppingToken.IsCancellationRequested && !s3Ready && retryCount < 5)
-            {
-                s3Ready = await EnsureBucketExistsAsync(stoppingToken);
-                if (!s3Ready)
-                {
-                    retryCount++;
-                    _logger.LogWarning($"Попытка подключения к S3 ({retryCount}/5) не удалась. Пауза 10 сек...");
-                    await Task.Delay(10000, stoppingToken);
-                }
-            }
-
-            if (!s3Ready)
+            if (!await CheckS3ConnectionAsync(stoppingToken))
             {
                 _logger.LogCritical("Не удалось подключиться к S3 после нескольких попыток. Сервис остановлен.");
                 return;
             }
 
-            // --- ЭТАП 3: ОЧИСТКА "ЗАВИСШИХ" ФАЙЛОВ ---
             _logger.LogInformation("Проверки пройдены. Запуск очистки временных файлов...");
-            await ClearProcessingAsync(stoppingToken);
+            await ClearProcessingMarkersAsync(stoppingToken);
+            #endregion
 
-            // --- ЭТАП 4: ЗАПУСК CONSUMERS ---
+            #region Запуск consumer задач
             var archivingTask = ProcessArchivingAsync(stoppingToken);
-            var smallConsumer = ProcessUploadingAsync(_smallFilesChannel.Reader, stoppingToken, "SmallWorker");
-            var largeConsumer = ProcessUploadingAsync(_largeFilesChannel.Reader, stoppingToken, "LargeWorker");
+            var smallUploadTask = ProcessUploadingAsync(_smallFilesChannel.Reader, stoppingToken, "SmallWorker");
+            var largeUploadTask = ProcessUploadingAsync(_largeFilesChannel.Reader, stoppingToken, "LargeWorker");
+            #endregion
 
-            // --- ЭТАП 5: ОБРАБОТКА РАСПИСАНИЯ ---
-            if (_intervalHours == 0)
-            {
-                if (_startTime.HasValue)
-                {
-                    _logger.LogWarning("Директива StartTime проигнорирована, поскольку IntervalHours = 0. Работаем в бесконечном цикле.");
-                }
-                // Нет ожидания первого запуска, сразу цикл
-            }
-            else
-            {
-                if (!_startTime.HasValue)
-                {
-                    throw new InvalidOperationException("StartTime должен быть указан, если IntervalHours != 0.");
-                }
+            #region Обработка расписания
+            await HandleSchedulingDelayAsync(stoppingToken);
+            #endregion
 
-                // Ожидание первого запуска
-                var delay = _startTime.Value - DateTime.Now;
-                if (delay > TimeSpan.Zero)
-                {
-                    _logger.LogInformation($"Ожидание первого запуска до {_startTime.Value}...");
-                    await Task.Delay(delay, stoppingToken);
-                }
-                else
-                {
-                    _logger.LogInformation("Время начала в прошлом — запуск immediate.");
-                }
-            }
-
-            // --- ЭТАП 6: ОСНОВНОЙ ЦИКЛ ---
+            #region Основной цикл сканирования
             try
             {
                 while (!stoppingToken.IsCancellationRequested)
                 {
+                    DateTime startTime = DateTime.Now;
                     await ScanFileSystemAsync(stoppingToken);
                     if (_archiveClearedSeconds != 0)
                     {
                         CleanArchive(_archiveClearedSeconds);
                     }
-
-                    // Задержка и логирование следующего запуска
-                    if (_intervalHours > 0)
-                    {
-                        var nextRun = DateTime.Now + TimeSpan.FromHours(_intervalHours);
-                        _logger.LogInformation($"Следующий запуск запланирован на {nextRun}.");
-                        var delayMs = _intervalHours * 60 * 60 * 1000; // Часы в миллисекунды
-                        await Task.Delay(delayMs, stoppingToken);
-                    }
-                    else
-                    {
-                        // Обычная пауза 5 секунд
-                        await Task.Delay(5000, stoppingToken);
-                    }
+                    await HandleScanDelayAsync(startTime, stoppingToken);
                 }
             }
             catch (OperationCanceledException) { }
@@ -202,157 +165,182 @@ namespace AWSUploadService
             }
             finally
             {
-                // Завершаем каналы
-                _archivingChannel.Writer.Complete();
-                _smallFilesChannel.Writer.Complete();
-                _largeFilesChannel.Writer.Complete();
+                CompleteChannels();
+                await Task.WhenAll(archivingTask, smallUploadTask, largeUploadTask);
+            }
+            #endregion
+        }
 
-                // Ждём завершения consumers
-                await Task.WhenAll(archivingTask, smallConsumer, largeConsumer);
+        private async Task HandleSchedulingDelayAsync(CancellationToken ct)
+        {
+            if (_intervalHours == 0)
+            {
+                if (_startTime.HasValue)
+                {
+                    _logger.LogWarning("Директива StartTime проигнорирована, поскольку IntervalHours = 0. Работаем в бесконечном цикле.");
+                }
+                return;
+            }
+
+            if (!_startTime.HasValue)
+            {
+                throw new InvalidOperationException("StartTime должен быть указан, если IntervalHours != 0.");
+            }
+
+            var delay = _startTime.Value - DateTime.Now;
+            if (delay > TimeSpan.Zero)
+            {
+                _logger.LogInformation($"Ожидание первого запуска до {_startTime.Value}...");
+                await Task.Delay(delay, ct);
+            }
+            else
+            {
+                _logger.LogInformation("Время начала в прошлом — запуск immediate.");
             }
         }
-       
-        // --- 1. SCANNER (PRODUCER) ---
+
+        private async Task HandleScanDelayAsync(DateTime iterationStartTime, CancellationToken ct)
+        {
+            if (_intervalHours <= 0)
+            {
+                await Task.Delay(DefaultScanDelayMs, ct);
+                return;
+            }
+
+            // 1. Проверяем, есть ли еще работа. 
+            // Если работа еще идет, мы НЕ ЖДЕМ (как в while), а просто выходим,
+            // чтобы основной цикл сразу перешел к расчету времени до следующего слота.
+            bool stillWorking = !_activeUploads.IsEmpty || _archivingChannel.Reader.Count > 0;
+
+            if (stillWorking)
+            {
+                _logger.LogWarning($"Итерация завершена со шлейфом активных задач. " +
+                                   $"Загрузок: {_activeUploads.Count}, В очереди архива: {_archivingChannel.Reader.Count}. " +
+                                   "Текущий цикл сканирования будет пропущен.");
+            }
+
+            // 2. Рассчитываем целевое время следующего запуска (строго от начала текущего)
+            DateTime nextRunTime = iterationStartTime.AddHours(_intervalHours);
+            TimeSpan delay = nextRunTime - DateTime.Now;
+
+            if (delay > TimeSpan.Zero)
+            {
+                _logger.LogInformation($"Ожидание до следующего запланированного запуска: {nextRunTime}");
+                await Task.Delay(delay, ct);
+            }
+            else
+            {
+                // Если работа (или ожидание шлейфа) заняла больше времени, чем сам интервал
+                _logger.LogWarning($"Задержка превысила интервал. Следующая итерация начнется немедленно.");
+            }
+        }
+
+        private void CompleteChannels()
+        {
+            _archivingChannel.Writer.Complete();
+            _smallFilesChannel.Writer.Complete();
+            _largeFilesChannel.Writer.Complete();
+        }
+
+        #region Scanner (Producer)
         private async Task ScanFileSystemAsync(CancellationToken ct)
         {
             if (!Directory.Exists(_sourceFolder)) return;
 
             var directories = Directory.GetDirectories(_sourceFolder);
-            foreach (var subDirectory in directories)
+            foreach (var parentDir in directories)
             {
-                // Обработка файлов в ParentDir (Прямая загрузка)
-                var filesInParent = Directory.EnumerateFiles(subDirectory);
-                foreach (var file in filesInParent)
-                {
-                    if (Path.GetExtension(file).ToLower() == ".notdelete") continue;
-                    if (_activeUploads.ContainsKey(file)) continue;
-                    if (IsMarked(file)) continue;
+                var parentDirName = Path.GetFileName(parentDir);
 
-                    if ((DateTime.Now - File.GetLastWriteTime(file)).TotalSeconds > 30)
-                    {
-                        if (_activeUploads.TryAdd(file, 0))
-                        {
-                            var fileInfo = new FileInfo(file);
-                            var task = new UploadTask(file, subDirectory);
-                            var channel = fileInfo.Length >= LargeFileThreshold ? _largeFilesChannel : _smallFilesChannel;
-                            await channel.Writer.WriteAsync(task, ct);
-                        }
-                    }
-                }
+                // Обработка файлов в parentDir
+                await ProcessFilesInDirectoryAsync(parentDir, parentDirName, ct);
 
-                // Обработка поддиректорий в ParentDir
-                var parentDirName = new DirectoryInfo(subDirectory).Name;
-                string[] subSubDirs;
-                try
-                {
-                    subSubDirs = Directory.GetDirectories(subDirectory);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning($"Не удалось прочитать папку {subDirectory}: {ex.Message}");
-                    continue;
-                }
-                foreach (var dir in subSubDirs)
-                {
-                    if (IsMarked(dir)) continue;
-                    if (!IsDirectoryReady(dir)) continue;
+                // Обработка поддиректорий
+                await ProcessSubDirectoriesAsync(parentDir, parentDirName, ct);
+            }
+        }
 
-                    var processedDir = TryMarkProcessingDir(dir);
-                    if (processedDir != null)
-                    {
-                        await _archivingChannel.Writer.WriteAsync(new FolderTask(processedDir, parentDirName), ct);
-                    }
+        private async Task ProcessFilesInDirectoryAsync(string directory, string parentDirName, CancellationToken ct)
+        {
+            var files = Directory.EnumerateFiles(directory);
+            foreach (var file in files)
+            {
+                if (Path.GetExtension(file).Equals(".notdelete", StringComparison.OrdinalIgnoreCase)) continue;
+                if (_activeUploads.ContainsKey(file)) continue;
+                if (IsMarkedAsProcessing(file)) continue;
+
+                if ((DateTime.Now - File.GetLastWriteTime(file)).TotalSeconds <= FileWriteDelaySeconds) continue;
+
+                if (_activeUploads.TryAdd(file, 0))
+                {
+                    var fileInfo = new FileInfo(file);
+                    var task = new UploadTask(file, parentDirName);
+                    var channel = fileInfo.Length >= LargeFileThreshold ? _largeFilesChannel : _smallFilesChannel;
+                    await channel.Writer.WriteAsync(task, ct);
                 }
             }
         }
 
-        private async Task ClearProcessingAsync(CancellationToken ct)
+        private async Task ProcessSubDirectoriesAsync(string parentDir, string parentDirName, CancellationToken ct)
+        {
+            string[] subDirs;
+            try
+            {
+                subDirs = Directory.GetDirectories(parentDir);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, $"Не удалось прочитать папку {parentDir}");
+                return;
+            }
+
+            foreach (var subDir in subDirs)
+            {
+                if (IsMarkedAsProcessing(subDir)) continue;
+                if (!IsDirectoryReady(subDir)) continue;
+
+                var markedDir = MarkDirectoryAsProcessing(subDir);
+                if (markedDir != null)
+                {
+                    await _archivingChannel.Writer.WriteAsync(new FolderTask(markedDir, parentDirName), ct);
+                }
+            }
+        }
+        #endregion
+
+        #region Очистка маркеров обработки
+        private async Task ClearProcessingMarkersAsync(CancellationToken ct)
         {
             if (!Directory.Exists(_sourceFolder)) return;
 
             var directories = Directory.GetDirectories(_sourceFolder);
-            foreach (var subDirectory in directories)
+            foreach (var parentDir in directories)
             {
-                var subSubDirs = Directory.GetDirectories(subDirectory);
-                foreach (var dir in subSubDirs)
+                var subDirs = Directory.GetDirectories(parentDir);
+                foreach (var subDir in subDirs)
                 {
-                    if (IsMarked(dir))
+                    if (IsMarkedAsProcessing(subDir))
                     {
-                        var newName = dir.Replace(_processingMarker, string.Empty);
-                        TryRenameDir(dir, newName);
+                        UnmarkDirectoryProcessing(subDir);
                     }
                 }
             }
         }
+        #endregion
 
-        private bool IsDirectoryReady(string path)
-        {
-            var files = Directory.GetFiles(path, "*", SearchOption.AllDirectories);
-            if (!files.Any()) return false;
-
-            var lastWriteTime = files.Select(File.GetLastWriteTime).Max();
-            var timeDiff = (DateTime.Now - lastWriteTime).TotalSeconds;
-
-            if (timeDiff < 0)
-            {
-                _logger.LogWarning($"Обнаружены файлы из будущего в {path}: {lastWriteTime}");
-                return false;
-            }
-
-            return timeDiff > 30;
-        }
-
-        private bool IsMarked(string path)
-        {
-            var name = Path.GetFileName(path);
-            return name.EndsWith(_processingMarker);
-        }
-
-        private string TryMarkProcessingDir(string originalDir)
-        {
-            var timestamp = DateTime.Now.ToString("dd_MM_yy_hh_mm_ss");
-            var newName = originalDir + "_" + timestamp + _processingMarker;
-            return TryRenameDir(originalDir, newName) ? newName : null;
-        }
-
-        private string TryMarkProcessed(string originalPath)
-        {
-            if (!originalPath.EndsWith(_processingMarker)) return originalPath;
-
-            var newName = originalPath.Replace(_processingMarker, string.Empty);
-            return TryRenameDir(originalPath, newName) ? newName : null;
-        }
-
-        private bool TryRenameDir(string source, string dest)
-        {
-            try
-            {
-                Directory.Move(source, dest);
-                return true;
-            }
-            catch (DirectoryNotFoundException) { }
-            catch (IOException ex) when (ex.Message.Contains("уже существует")) { }
-            catch (UnauthorizedAccessException) { }
-            catch (Exception ex) 
-            {
-                _logger.LogDebug(ex, $"Ошибка переименования '{source}' в '{dest}'"); 
-                return false;
-            }
-            return false;
-        }
-
-        // --- 2. ARCHIVER (CONSUMER 1) ---
+        #region Archiver (Consumer)
         private async Task ProcessArchivingAsync(CancellationToken ct)
         {
             await foreach (var task in _archivingChannel.Reader.ReadAllAsync(ct))
             {
                 try
                 {
-                    CreateNotDeleteFile(Path.Combine(Path.GetDirectoryName(task.FolderPath), task.ParentDirName + ".notDelete"));
-                    var zipPath = await FolderToZipAsync(task.FolderPath);
+                    CreateNotDeleteFileIfNotExists(Path.Combine(Path.GetDirectoryName(task.FolderPath), $"{task.ParentDirName}.notDelete"));
+
+                    var zipPath = await ArchiveFolderAsync(task.FolderPath);
                     if (!string.IsNullOrEmpty(zipPath) && File.Exists(zipPath))
                     {
-                        HandlePostZipCleanup(task);
+                        HandlePostArchiveCleanup(task);
                     }
                 }
                 catch (Exception ex)
@@ -362,54 +350,74 @@ namespace AWSUploadService
             }
         }
 
-        // --- 3. UPLOADER (CONSUMER 2) ---
+        private async Task<string> ArchiveFolderAsync(string folderPath)
+        {
+            return await Task.Run(() =>
+            {
+                var zipFileName = folderPath.Replace(ProcessingMarker, $".zip{ProcessingMarker}");
+                zipFileName = GetUniqueFileName(zipFileName);
+
+                ZipFile.CreateFromDirectory(folderPath, zipFileName, CompressionLevel.Fastest, false);
+
+                return UnmarkFileProcessing(zipFileName);
+            });
+        }
+
+        private void HandlePostArchiveCleanup(FolderTask task)
+        {
+            var cleanedPath = UnmarkDirectoryProcessing(task.FolderPath);
+            if (cleanedPath == null) return;
+
+            if (_toArchivSourceFolder)
+            {
+                MoveDirectory(cleanedPath, Path.Combine(_archiveDirectory, task.ParentDirName));
+            }
+            else
+            {
+                Directory.Delete(cleanedPath, true);
+            }
+        }
+        #endregion
+
+        #region Uploader (Consumer)
         private async Task ProcessUploadingAsync(ChannelReader<UploadTask> reader, CancellationToken ct, string workerName)
         {
             await foreach (var task in reader.ReadAllAsync(ct))
             {
                 try
                 {
-                    // 1. Валидация пути S3
-                    string safeKey;
-                    try
+                    var s3Key = BuildS3Key(task);
+                    if (s3Key == null)
                     {
-                        string rawKey = _targetBucketPrefix + Path.GetFileName(task.ParentDirName) + "/" + Path.GetFileName(task.FilePath);
-                        safeKey = ValidateAndFixS3Key(rawKey);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError($"Фатальная ошибка пути для {task.FilePath}: {ex.Message}");
-                        MoveToErrorDirectory(task.FilePath); // Сразу в карантин
+                        MoveToErrorDirectory(task.FilePath);
                         continue;
                     }
 
                     var uploadRequest = new TransferUtilityUploadRequest
                     {
                         BucketName = _targetBucketName,
-                        Key = safeKey,
+                        Key = s3Key,
                         FilePath = task.FilePath,
-                        PartSize = 200 * 1024 * 1024,
+                        PartSize = S3PartSizeBytes,
                         DisablePayloadSigning = false,
                         AutoCloseStream = true
                     };
+
                     await _transferUtility.UploadAsync(uploadRequest, ct);
+
                     HandlePostUploadCleanup(task);
                 }
-                catch (Amazon.Runtime.AmazonServiceException ex)
+                catch (AmazonS3Exception ex)
                 {
-                    // Сервер S3 ответил ошибкой (например, 500 или 503 Slow Down)
-                    _logger.LogError($"AWS Server Error при загрузке {task.FilePath}: {ex.Message}. Code: {ex.ErrorCode}");
+                    _logger.LogError(ex, $"AWS ошибка при загрузке {task.FilePath}. Code: {ex.ErrorCode}");
                 }
-                catch (Amazon.Runtime.AmazonClientException ex)
+                catch (AmazonClientException ex)
                 {
-                    // Ошибка сети. Вот тут ловится HttpErrorResponseException.
-                    _logger.LogError($"Сетевая ошибка AWS при загрузке {task.FilePath}: {ex.Message}");
-                    // Здесь можно не удалять файл из _activeUploads, чтобы попробовать снова в следующем цикле сканирования, 
-                    // но у вас логика построена так, что он останется в папке и подхватится снова.
+                    _logger.LogError(ex, $"Сетевая ошибка AWS при загрузке {task.FilePath}");
                 }
                 catch (IOException ex)
                 {
-                    _logger.LogError($"Ошибка доступа к файлу {task.FilePath}: {ex.Message}");
+                    _logger.LogError(ex, $"Ошибка доступа к файлу {task.FilePath}");
                 }
                 catch (Exception ex)
                 {
@@ -418,9 +426,22 @@ namespace AWSUploadService
                 }
                 finally
                 {
-                    // Всегда освобождаем маркер занятости
                     _activeUploads.TryRemove(task.FilePath, out _);
                 }
+            }
+        }
+
+        private string? BuildS3Key(UploadTask task)
+        {
+            try
+            {
+                var rawKey = _targetBucketPrefix + Path.GetFileName(task.ParentDirName) + "/" + Path.GetFileName(task.FilePath);
+                return ValidateAndFixS3Key(rawKey);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Фатальная ошибка пути для {task.FilePath}");
+                return null;
             }
         }
 
@@ -431,51 +452,97 @@ namespace AWSUploadService
                 var dateFolder = Path.GetFileName(task.ParentDirName);
                 var destFolder = Path.Combine(_archiveDirectory, dateFolder);
                 Directory.CreateDirectory(destFolder);
+
                 var destPath = GetUniqueFileName(Path.Combine(destFolder, Path.GetFileName(task.FilePath)));
-                if (!File.Exists(destPath))
-                {
-                    File.Move(task.FilePath, destPath);
-                }
+                File.Move(task.FilePath, destPath);
             }
             else
             {
-                DeleteFile(task.FilePath);
+                DeleteFileSafely(task.FilePath);
             }
         }
+        #endregion
 
-        private void HandlePostZipCleanup(FolderTask task)
+        #region Вспомогательные методы для файлов и директорий
+        private bool IsDirectoryReady(string path)
         {
-            if (_toArchivSourceFolder)
+            var files = Directory.GetFiles(path, "*", SearchOption.AllDirectories);
+            if (files.Length == 0) return false;
+
+            var lastWriteTime = files.Max(File.GetLastWriteTime);
+            var timeDiff = (DateTime.Now - lastWriteTime).TotalSeconds;
+
+            if (timeDiff < 0)
             {
-                MoveDir(task.FolderPath, Path.Combine(_archiveDirectory, task.ParentDirName));
+                _logger.LogWarning($"Обнаружены файлы из будущего в {path}: {lastWriteTime}");
+                return false;
             }
-            else
-            {
-                Directory.Delete(task.FolderPath, true);
-            }
+
+            return timeDiff > FileWriteDelaySeconds;
         }
 
-        // --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ---
-        private async Task<string> FolderToZipAsync(string folderPath)
+        private bool IsMarkedAsProcessing(string path)
         {
-            string zipPath = string.Empty;
-            await Task.Run(() =>
-            {
-                var zipFileName = folderPath.Replace(_processingMarker, $".zip{_processingMarker}");
-                zipFileName = GetUniqueFileName(zipFileName);
-                ZipFile.CreateFromDirectory(folderPath, zipFileName, CompressionLevel.Fastest, false);
-                zipPath = TryMarkProcessed(zipFileName);
-            });
-            return zipPath;
+            return Path.GetFileName(path).EndsWith(ProcessingMarker);
         }
 
-        private void MoveDir(string sourceDir, string destDir)
+        private string? MarkDirectoryAsProcessing(string originalDir)
+        {
+            var timestamp = DateTime.Now.ToString("dd_MM_yy_hh_mm_ss");
+            var newName = originalDir + "_" + timestamp + ProcessingMarker;
+            return RenameDirectory(originalDir, newName) ? newName : null;
+        }
+
+        private string? UnmarkDirectoryProcessing(string originalPath)
+        {
+            if (!originalPath.EndsWith(ProcessingMarker)) return originalPath;
+
+            var newName = originalPath.Replace(ProcessingMarker, string.Empty);
+            return RenameDirectory(originalPath, newName) ? newName : null;
+        }
+
+        private string? UnmarkFileProcessing(string originalPath)
+        {
+            if (!originalPath.EndsWith(ProcessingMarker)) return originalPath;
+
+            var newName = originalPath.Replace(ProcessingMarker, string.Empty);
+            return RenameFile(originalPath, newName) ? newName : null;
+        }
+
+        private bool RenameDirectory(string source, string dest)
+        {
+            try
+            {
+                Directory.Move(source, dest);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, $"Ошибка переименования директории '{source}' в '{dest}'");
+                return false;
+            }
+        }
+
+        private bool RenameFile(string source, string dest)
+        {
+            try
+            {
+                File.Move(source, dest);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, $"Ошибка переименования файла '{source}' в '{dest}'");
+                return false;
+            }
+        }
+
+        private void MoveDirectory(string sourceDir, string destParent)
         {
             if (!Directory.Exists(sourceDir)) return;
 
-            destDir = GetUniqueDirName(Path.Combine(destDir, Path.GetFileName(sourceDir).Replace(_processingMarker, string.Empty)));
+            var destDir = GetUniqueDirectoryName(Path.Combine(destParent, Path.GetFileName(sourceDir)));
 
-            // Создаём родительскую директорию для destDir, если нужно
             var parentDir = Path.GetDirectoryName(destDir);
             if (!string.IsNullOrEmpty(parentDir))
             {
@@ -488,17 +555,14 @@ namespace AWSUploadService
             }
             else
             {
-                CopyDirectory(sourceDir, destDir);
+                CopyDirectoryRecursive(sourceDir, destDir);
                 Directory.Delete(sourceDir, true);
             }
         }
 
-        public static void CopyDirectory(string sourceDir, string destDir)
+        private static void CopyDirectoryRecursive(string sourceDir, string destDir)
         {
-            if (!Directory.Exists(destDir))
-            {
-                Directory.CreateDirectory(destDir);
-            }
+            Directory.CreateDirectory(destDir);
 
             foreach (var file in Directory.GetFiles(sourceDir))
             {
@@ -506,35 +570,35 @@ namespace AWSUploadService
                 File.Copy(file, destFile, true);
             }
 
-            foreach (var dir in Directory.GetDirectories(sourceDir))
+            foreach (var subDir in Directory.GetDirectories(sourceDir))
             {
-                var destSubDir = Path.Combine(destDir, Path.GetFileName(dir));
-                CopyDirectory(dir, destSubDir);
+                var destSubDir = Path.Combine(destDir, Path.GetFileName(subDir));
+                CopyDirectoryRecursive(subDir, destSubDir);
             }
         }
 
-        private void CleanArchive(uint time)
+        private void CleanArchive(uint retentionSeconds)
         {
             if (!Directory.Exists(_archiveDirectory)) return;
 
-            foreach (var directory in Directory.GetDirectories(_archiveDirectory))
+            foreach (var dir in Directory.GetDirectories(_archiveDirectory))
             {
-                if ((DateTime.Now - Directory.GetCreationTime(directory)).TotalSeconds > time)
+                if ((DateTime.Now - Directory.GetCreationTime(dir)).TotalSeconds > retentionSeconds)
                 {
-                    Directory.Delete(directory, true);
+                    Directory.Delete(dir, true);
                 }
             }
         }
 
-        private void CreateNotDeleteFile(string path)
+        private void CreateNotDeleteFileIfNotExists(string path)
         {
             if (!File.Exists(path))
             {
-                using (File.Create(path)) { }
+                File.Create(path).Dispose();
             }
         }
 
-        private void DeleteFile(string path)
+        private void DeleteFileSafely(string path)
         {
             if (File.Exists(path))
             {
@@ -551,31 +615,26 @@ namespace AWSUploadService
             {
                 var nameWithoutExt = Path.GetFileNameWithoutExtension(original);
                 var ext = Path.GetExtension(original);
-                filePath = Path.Combine(Path.GetDirectoryName(original), $"{nameWithoutExt} ({count}){ext}");
+                filePath = Path.Combine(Path.GetDirectoryName(original)!, $"{nameWithoutExt} ({count}){ext}");
                 count++;
             }
             return filePath;
         }
 
-        private static string GetUniqueDirName(string dirPath)
+        private static string GetUniqueDirectoryName(string dirPath)
         {
             var original = dirPath;
             var count = 1;
             while (Directory.Exists(dirPath))
             {
-                dirPath = Path.Combine(Path.GetDirectoryName(original), $"{Path.GetFileName(original)} ({count})");
+                dirPath = $"{original} ({count})";
                 count++;
             }
             return dirPath;
         }
+        #endregion
 
-
-
-
-
-        //////////Валидация 
-        // --- PRE-FLIGHT CHECKS ---
-
+        #region Валидация конфигурации и S3
         private bool ValidateConfiguration()
         {
             var errors = new List<string>();
@@ -585,36 +644,13 @@ namespace AWSUploadService
             if (string.IsNullOrWhiteSpace(_errorDirectory)) errors.Add("ErrorDirectory не указан.");
             if (string.IsNullOrWhiteSpace(_bucketName)) errors.Add("BucketName не указан.");
 
-            // Проверка существования локальных папок
             if (!Directory.Exists(_sourceFolder))
                 errors.Add($"Исходная папка не существует: {_sourceFolder}");
 
-            // Папку архива можно создать, если нет
-            if (!string.IsNullOrWhiteSpace(_archiveDirectory) && !Directory.Exists(_archiveDirectory))
-            {
-                try
-                {
-                    Directory.CreateDirectory(_archiveDirectory);
-                }
-                catch (Exception ex)
-                {
-                    errors.Add($"Не удалось создать папку архива {_archiveDirectory}: {ex.Message}");
-                }
-            }
-            // 3. Проверка/Создание папки ошибок (карантина)
-            if (!string.IsNullOrWhiteSpace(_errorDirectory) && !Directory.Exists(_errorDirectory))
-            {
-                try
-                {
-                    Directory.CreateDirectory(_errorDirectory);
-                    _logger.LogInformation($"Создана директория ошибок: {_errorDirectory}");
-                }
-                catch (Exception ex)
-                {
-                    errors.Add($"Не удалось создать папку ошибок {_errorDirectory}: {ex.Message}");
-                }
-            }
-            if (errors.Any())
+            CreateDirectoryIfNotExists(_archiveDirectory, errors, "архива");
+            CreateDirectoryIfNotExists(_errorDirectory, errors, "ошибок");
+
+            if (errors.Count > 0)
             {
                 _logger.LogCritical("ОШИБКИ КОНФИГУРАЦИИ:\n" + string.Join("\n", errors));
                 return false;
@@ -623,35 +659,64 @@ namespace AWSUploadService
             return true;
         }
 
+        private void CreateDirectoryIfNotExists(string path, List<string> errors, string description)
+        {
+            if (string.IsNullOrWhiteSpace(path) || Directory.Exists(path)) return;
+
+            try
+            {
+                Directory.CreateDirectory(path);
+                _logger.LogInformation($"Создана директория {description}: {path}");
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"Не удалось создать папку {description} {path}: {ex.Message}");
+            }
+        }
+
+        private async Task<bool> CheckS3ConnectionAsync(CancellationToken ct)
+        {
+            bool s3Ready = false;
+            int retryCount = 0;
+
+            while (!ct.IsCancellationRequested && !s3Ready && retryCount < S3ConnectionRetries)
+            {
+                s3Ready = await EnsureBucketExistsAsync(ct);
+                if (!s3Ready)
+                {
+                    retryCount++;
+                    _logger.LogWarning($"Попытка подключения к S3 ({retryCount}/{S3ConnectionRetries}) не удалась. Пауза {S3RetryDelayMs / 1000} сек...");
+                    await Task.Delay(S3RetryDelayMs, ct);
+                }
+            }
+
+            return s3Ready;
+        }
+
         private async Task<bool> EnsureBucketExistsAsync(CancellationToken ct)
         {
             try
             {
                 _logger.LogInformation($"Проверка доступности бакета: {_targetBucketName}...");
 
-                // Метод GetBucketLocationAsync — самый надежный способ проверить реальное наличие
-                await _s3Client.GetBucketLocationAsync(new GetBucketLocationRequest
-                {
-                    BucketName = _targetBucketName
-                }, ct);
+                await _s3Client.GetBucketLocationAsync(new GetBucketLocationRequest { BucketName = _targetBucketName }, ct);
 
                 _logger.LogInformation($"Бакет '{_targetBucketName}' подтвержден.");
                 return true;
             }
-            catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+            catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
-                // Бакет точно не найден — пытаемся создать
                 _logger.LogWarning($"Бакет '{_targetBucketName}' не найден (404). Попытка создания...");
                 return await CreateBucketAsync(ct);
             }
-            catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden)
+            catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
             {
                 _logger.LogCritical($"Ошибка 403: Нет прав доступа к бакету '{_targetBucketName}' или он не существует.");
                 return false;
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Ошибка при проверке бакета: {ex.Message}");
+                _logger.LogError(ex, $"Ошибка при проверке бакета");
                 return false;
             }
         }
@@ -671,7 +736,7 @@ namespace AWSUploadService
             }
             catch (Exception ex)
             {
-                _logger.LogCritical($"Не удалось создать бакет: {ex.Message}");
+                _logger.LogCritical(ex, "Не удалось создать бакет");
                 return false;
             }
         }
@@ -681,60 +746,57 @@ namespace AWSUploadService
             if (string.IsNullOrWhiteSpace(key))
                 throw new ArgumentException("S3 Key cannot be empty.");
 
-            // 1. Заменяем обратные слеши (Windows style) на прямые
-            string fixedKey = key.Replace("\\", "/");
+            // Замена обратных слешей на прямые
+            var fixedKey = key.Replace("\\", "/");
 
-            // 2. Удаляем двойные слеши, которые создают "пустые" папки
+            // Удаление двойных слешей
             while (fixedKey.Contains("//"))
             {
                 fixedKey = fixedKey.Replace("//", "/");
             }
 
-            // 3. Удаляем ведущий слеш (S3 ключи обычно начинаются без него)
+            // Удаление ведущего слеша
             fixedKey = fixedKey.TrimStart('/');
 
-            // 4. Проверка на недопустимые символы (ASCII управляющие символы и др.)
-            // Рекомендуется избегать: \ { } ^ % ` ] [ > < ~ # |
+            // Замена недопустимых символов
             char[] invalidChars = { '\\', '{', '}', '^', '%', '`', ']', '[', '>', '<', '~', '#', '|' };
             foreach (var c in invalidChars)
             {
                 if (fixedKey.Contains(c))
                 {
-                    _logger.LogWarning($"Символ '{c}' в ключе S3 '{fixedKey}' может вызвать проблемы в некоторых клиентах. Попытка заменить '{fixedKey}' на '_'");
-                    // Можно либо заменить на '_', либо оставить как есть, если ваш S3 провайдер их поддерживает
-                     fixedKey = fixedKey.Replace(c, '_'); 
+                    _logger.LogWarning($"Символ '{c}' в ключе S3 '{fixedKey}' заменён на '_'");
+                    fixedKey = fixedKey.Replace(c, '_');
                 }
             }
 
-            // 5. Ограничение длины (S3 поддерживает до 1024 байт)
-            if (System.Text.Encoding.UTF8.GetByteCount(fixedKey) > 1024)
+            // Проверка длины
+            if (Encoding.UTF8.GetByteCount(fixedKey) > 1024)
             {
-                throw new Exception($"Путь S3 слишком длинный: {fixedKey.Length} символов. Файл перемещен в директорию с архивами или удален.");
+                throw new InvalidOperationException($"Путь S3 слишком длинный: {fixedKey.Length} символов.");
             }
 
             return fixedKey;
         }
+        #endregion
 
+        #region Обработка ошибок (карантин)
         private void MoveToErrorDirectory(string filePath)
         {
             try
             {
-                if (!Directory.Exists(_errorDirectory))
-                    Directory.CreateDirectory(_errorDirectory);
+                Directory.CreateDirectory(_errorDirectory);
 
-                string fileName = Path.GetFileName(filePath);
-                string destPath = Path.Combine(_errorDirectory, fileName);
+                var fileName = Path.GetFileName(filePath);
+                var destPath = GetUniqueFileName(Path.Combine(_errorDirectory, fileName));
 
-                // Гарантируем уникальность имени в папке ошибок
-                string uniqueDestPath = GetUniqueFileName(destPath);
-
-                File.Move(filePath, uniqueDestPath);
-                _logger.LogWarning($"Файл перемещен в КАРАНТИН: {uniqueDestPath}");
+                File.Move(filePath, destPath);
+                _logger.LogWarning($"Файл перемещен в ошибку: {destPath}");
             }
             catch (Exception ex)
             {
-                _logger.LogCritical($"НЕВОЗМОЖНО переместить файл в папку ошибок: {filePath}. Ошибка: {ex.Message}");
+                _logger.LogCritical(ex, $"НЕВОЗМОЖНО переместить файл в папку ошибок: {filePath}");
             }
         }
+        #endregion
     }
 }
